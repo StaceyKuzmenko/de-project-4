@@ -36,7 +36,7 @@
 
 CREATE TABLE stg.couriers (
 
-	id int4 NOT NULL GENERATED ALWAYS AS IDENTITY( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START 1 CACHE 1 NO CYCLE),
+	id varchar NOT NULL,
 	object_value text NOT NULL,
 	update_ts timestamp NOT NULL,
 	CONSTRAINT couriers_pkey PRIMARY KEY (id)
@@ -47,7 +47,7 @@ CREATE TABLE stg.couriers (
 
 CREATE TABLE stg.deliveries (
 
-	id int4 NOT NULL GENERATED ALWAYS AS IDENTITY( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START 1 CACHE 1 NO CYCLE),
+	id varchar NOT NULL,
 	object_value text NOT NULL,
 	update_ts timestamp NOT NULL,
 	CONSTRAINT deliveries_pkey PRIMARY KEY (id)
@@ -72,10 +72,10 @@ CREATE TABLE dds.dm_couriers (
 CREATE TABLE dds.dm_deliveries (
 
 	id int4 NOT NULL GENERATED ALWAYS AS IDENTITY( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START 1 CACHE 1 NO CYCLE),
-	order_id varchar NOT NULL,
+	order_id int4 NOT NULL,
 	order_ts timestamp NOT NULL,
 	delivery_id varchar NOT NULL,
-	courier_id varchar NOT NULL,
+	courier_id int4 NOT NULL,
 	address varchar NOT NULL,
 	delivery_ts timestamp NOT NULL,
 	rate int4 NOT NULL,
@@ -84,7 +84,8 @@ CREATE TABLE dds.dm_deliveries (
 	CONSTRAINT deliveries_pkey PRIMARY KEY (id),
 	CONSTRAINT deliveries_rate_check CHECK ((rate > 0)),
 	CONSTRAINT unique_delivery_id_key UNIQUE (delivery_id),
-	CONSTRAINT dm_deliverier_couriers_id_fkey FOREIGN KEY (courier_id) REFERENCES dds.dm_couriers(courier_id)
+	CONSTRAINT dm_deliverier_couriers_id_fkey FOREIGN KEY (courier_id) REFERENCES dds.dm_couriers(courier_id),
+ 	CONSTRAINT dm_deliveries_order_id_fkey FOREIGN KEY (order_id) REFERENCES dds.dm_orders(id)
 );
 
 ***Описание слоя cdm***
@@ -94,66 +95,80 @@ CREATE TABLE dds.dm_deliveries (
 
 CREATE TABLE cdm.dm_courier_ledger (
 
-	id int4 NOT NULL GENERATED ALWAYS AS IDENTITY( INCREMENT BY 1 MINVALUE 1 MAXVALUE 2147483647 START 1 CACHE 1 NO CYCLE
-	courier_id varchar NOT NULL,
+	id serial4 NOT NULL,
+	courier_id int4 NOT NULL,
 	courier_name varchar NOT NULL,
 	settlement_year int4 NOT NULL,
 	settlement_month int4 NOT NULL,
-	orders_count int4 NULL DEFAULT 0,
-	orders_total_sum numeric(14, 2) NULL DEFAULT 0,
-	rate_avg numeric(14, 2) NULL DEFAULT 0,
-	order_processing_fee numeric(14, 2) NULL DEFAULT 0,
-	courier_order_sum numeric(14, 2) NULL DEFAULT 0,
-	courier_tips_sum numeric(14, 2) NULL DEFAULT 0,
-	courier_reward_sum numeric(14, 2) NULL DEFAULT 0,
-	CONSTRAINT dm_courier_ledger_courier_order_sum_check CHECK ((courier_order_sum >= (0)::numeric)),
-	CONSTRAINT dm_courier_ledger_courier_reward_sum_check CHECK ((courier_reward_sum >= (0)::numeric)),
-	CONSTRAINT dm_courier_ledger_courier_tips_sum_check CHECK ((courier_tips_sum >= (0)::numeric)),
-	CONSTRAINT dm_courier_ledger_order_processing_fee_check CHECK ((order_processing_fee >= (0)::numeric)),
+	orders_count int4 NOT NULL,
+	orders_total_sum numeric(19, 5) NOT NULL,
+	rate_avg numeric(2, 1) NOT NULL,
+	order_processing_fee numeric(19, 5) NOT NULL,
+	courier_order_sum numeric(19, 5) NOT NULL,
+	courier_tips_sum numeric(19, 5) NOT NULL,
+	courier_reward_sum numeric(19, 5) NOT NULL,
+	CONSTRAINT dm_courier_ledger_courier_order_sum_check CHECK ((courier_order_sum > (0)::numeric)),
+	CONSTRAINT dm_courier_ledger_courier_reward_sum_check CHECK ((courier_reward_sum > (0)::numeric)),
+	CONSTRAINT dm_courier_ledger_courier_tips_sum_check CHECK ((courier_tips_sum > (0)::numeric)),
+	CONSTRAINT dm_courier_ledger_order_processing_fee_check CHECK ((order_processing_fee > (0)::numeric)),
 	CONSTRAINT dm_courier_ledger_orders_count_check CHECK ((orders_count >= 0)),
 	CONSTRAINT dm_courier_ledger_orders_total_sum_check CHECK ((orders_total_sum >= (0)::numeric)),
 	CONSTRAINT dm_courier_ledger_pkey PRIMARY KEY (id),
-	CONSTRAINT dm_courier_ledger_rate_avg_check CHECK ((rate_avg >= (0)::numeric)),
-	CONSTRAINT dm_courier_ledger_settlement_year_check CHECK (((settlement_year >= 2022) AND (settlement_year < 2099))),
-	CONSTRAINT dm_courier_ledger_unique UNIQUE (courier_id, settlement_year, settlement_month)
+	CONSTRAINT dm_courier_ledger_rate_avg_check CHECK ((rate_avg > (0)::numeric)),
+	CONSTRAINT dm_courier_ledger_settlement_month_check CHECK (((settlement_month >= 1) AND (settlement_month <= 12))),
+	CONSTRAINT dm_courier_ledger_settlement_year_check CHECK (((settlement_year >= 2020) AND (settlement_year <= 2099))),
+	CONSTRAINT dm_courier_ledger_unique UNIQUE (courier_id, settlement_year, settlement_month),
+	CONSTRAINT dm_courier_ledger_courier_id_fkey FOREIGN KEY (courier_id) REFERENCES dds.dm_couriers(id)
 );
 
 Для формирования итоговой витрины я использовала следующий запрос:
 
 	truncate table cdm.dm_courier_ledger RESTART IDENTITY;
-	with c as (select 
-                  b.courier_id,
-                  b.order_total_sum,
-                  case when b.rate_avg < 4 and b.courier_initial_order_sum < 100 then 100
-			                when b.rate_avg >= 4 and b.rate_avg < 4.5 and b.courier_initial_order_sum < 150 then 150
-	                    when b.rate_avg >= 4.5 and b.rate_avg < 4.9 and b.courier_initial_order_sum < 175 then 175
-	                    when b.rate_avg >= 4.9 and b.courier_initial_order_sum < 200 then 200
-	                else courier_initial_order_sum
-	                end courier_order_sum
-	          	from (
-                   select 
-                       distinct dd.courier_id,
-                       sum(dd.sum) over (partition by courier_id) order_total_sum,
-                       avg(dd.rate) over (partition by courier_id) as rate_avg,
-                       case when avg(dd.rate) over (partition by courier_id) < 4 then sum(dd.sum) over (partition by courier_id) * 0.05
-	                          when avg(dd.rate) over (partition by courier_id) >= 4 and avg(dd.rate) over (partition by courier_id) < 4.5 then sum(dd.sum) over (partition by courier_id) * 0.07
-	                          when avg(dd.rate) over (partition by courier_id) >= 4.5 and avg(dd.rate) over (partition by courier_id) < 4.9 then sum(dd.sum) over (partition by courier_id) * 0.08
-	                          when avg(dd.rate) over (partition by courier_id) >= 4.9 then sum(dd.sum) over (partition by courier_id) * 0.1
-                       end courier_initial_order_sum
-                    from dds.dm_deliveries dd) as b)
-	select 
-      distinct dd.courier_id,
-      dc.courier_name,
-      extract (year from dd.order_ts) as settlement_year,
-      extract (month from dd.order_ts) as settlement_month,
-      count(dd.order_id) over (partition by courier_id) as orders_count,
-      sum(dd.sum) over (partition by courier_id) order_total_sum,
-      avg(dd.rate) over (partition by courier_id) as rate_avg,
-      sum(dd.sum) over (partition by courier_id) * 0.25 order_processing_fee,
-      c.courier_order_sum,
-      sum(dd.tip_sum) over (partition by courier_id) as courier_tips_sum,
-      (c.courier_order_sum + sum(dd.tip_sum) over (partition by courier_id)) * 0.95 as courier_reward_sum
-  	from dds.dm_deliveries dd 
-    left join dds.dm_couriers dc using(courier_id)
-    left join c using(courier_id)
-    group by dd.courier_id, dd.order_ts, dc.courier_name, dd.order_id, dd.sum, dd.rate, dd.tip_sum, c.courier_order_sum;
+
+                    with c as (select 
+                                    b.courier_id,
+                                    b.order_total_sum,
+                                    case when b.rate_avg < 4 and b.courier_initial_order_sum < 100 then 100
+	                                    when b.rate_avg >= 4 and b.rate_avg < 4.5 and b.courier_initial_order_sum < 150 then 150
+	                                    when b.rate_avg >= 4.5 and b.rate_avg < 4.9 and b.courier_initial_order_sum < 175 then 175
+	                                    when b.rate_avg >= 4.9 and b.courier_initial_order_sum < 200 then 200
+	                                else courier_initial_order_sum
+	                                end courier_order_sum
+	                            from (
+                                    select 
+                                        distinct dd.courier_id,
+                                        sum(dd.sum) over (partition by dd.courier_id) order_total_sum,
+                                        avg(dd.rate) over (partition by dd.courier_id) as rate_avg,
+                                        case when avg(dd.rate) over (partition by dd.courier_id) < 4 then sum(dd.sum) over (partition by courier_id) * 0.05
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4 and avg(dd.rate) over (partition by courier_id) < 4.5 then sum(dd.sum) over (partition by courier_id) * 0.07
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4.5 and avg(dd.rate) over (partition by courier_id) < 4.9 then sum(dd.sum) over (partition by courier_id) * 0.08
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4.9 then sum(dd.sum) over (partition by courier_id) * 0.1
+                                        end courier_initial_order_sum
+                                    from dds.dm_deliveries dd) as b)
+                    insert into cdm.dm_courier_ledger (courier_id, 
+							courier_name, 
+							settlement_year, 
+							settlement_month, 
+							orders_count,
+							orders_total_sum,
+							rate_avg,
+							order_processing_fee,
+							courier_order_sum,
+							courier_tips_sum,
+							courier_reward_sum)    
+                    select 
+                        distinct dd.courier_id,
+                        dc.courier_name,
+                        extract (year from dd.order_ts) as settlement_year,
+                        extract (month from dd.order_ts) as settlement_month,
+                        count(dd.order_id) over (partition by dd.courier_id) as orders_count,
+                        sum(dd.sum) over (partition by dd.courier_id) order_total_sum,
+                        avg(dd.rate) over (partition by dd.courier_id) as rate_avg,
+                        sum(dd.sum) over (partition by dd.courier_id) * 0.25 order_processing_fee,
+                        c.courier_order_sum,
+                        sum(dd.tip_sum) over (partition by dd.courier_id) as courier_tips_sum,
+                        (c.courier_order_sum + sum(dd.tip_sum) over (partition by dd.courier_id)) * 0.95 as courier_reward_sum
+                    from dds.dm_deliveries dd 
+                    left join dds.dm_couriers dc on dd.courier_id = dc.id
+                    left join c on dd.courier_id = c.courier_id
+                    group by dd.courier_id, dd.order_ts, dc.courier_name, dd.order_id, dd.sum, dd.rate, dd.tip_sum, c.courier_order_sum;
