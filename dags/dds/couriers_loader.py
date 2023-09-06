@@ -1,129 +1,119 @@
 from logging import Logger
-from typing import List, Optional
+from typing import List, Optional, Dict
+from psycopg.rows import dict_row
 import json
 import logging
 from examples.dds.dds_settings_repository import EtlSetting, DdsEtlSettingsRepository
 from lib import PgConnect
-from lib.dict_util import json2str
 from psycopg import Connection
-from psycopg.rows import class_row
-from pydantic import BaseModel
+from lib.dict_util import json2str
 from datetime import datetime, date, time
 
 log = logging.getLogger(__name__)
 
-class CourierJsonObj(BaseModel):
-    id: int
-    object_value: str
-    update_ts: datetime
+class CourierReader:
+    def __init__(self, pg: PgConnect) -> None:
+        self.pg_client = pg.client()
 
+    def get_couriers(self, load_threshold: datetime) -> List[Dict]:
 
-class CourierDdsObj(BaseModel):
-    id: int
-    courier_id: str
-    courier_name: str
+        resultlist = []
 
-class CourierOriginRepository:
-    def load_raw_courier(self, conn: Connection, last_loaded_record_id: int) -> List[CourierJsonObj]:
-        with conn.cursor(row_factory=class_row(CourierJsonObj)) as cur:
+        with self.pg_client.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                     SELECT
                         id,
-                        replace(object_value, '''', '"') as object_value,
+                        object_value,
                         update_ts
                     FROM stg.couriers
-                    WHERE id > %(last_loaded_record_id)s;
+                    WHERE update_ts > %(load_threshold)s;
                 """,
-                {"last_loaded_record_id": last_loaded_record_id},
+                {"load_threshold": load_threshold},
             )
-            objs = cur.fetchall()
-        return objs
+            rows_list = cur.fetchall()
 
-class CourierDestRepository:
+            for row in rows_list:
+                courier_dict = json.loads(row['object_value'])
+                resultlist.append({'courier_id': row['id'], 
+                                    'name': courier_dict['name'], 
+                                    'update_ts': row['update_ts']})
 
-    def insert_courier(self, conn: Connection, courier: CourierDdsObj) -> None:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                    INSERT INTO dds.dm_couriers(courier_id, courier_name)
-                    VALUES (%(courier_id)s, %(courier_name)s)
-                    
-                """,
-                {
-                    "courier_id": courier.courier_id,
-                    "courier_name": courier.courier_name
-                },
-            )
-    
-    def get_courier(self, conn: Connection, courier_id: str) -> Optional[CourierDdsObj]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                    SELECT id, courier_id, courier_name
-                    FROM dds.dm_couriers
-                    WHERE courier_id = (%(courier_id)s)
-                """,
-                {
-                    "courier_id": courier_id
-                }
-            )
-            obj = cur.fetchone()
-            
-        return obj 
+        return resultlist
+
+class CourierSaver:
+        def save_courier(self, conn: Connection, courier_id: str, name: str):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                        INSERT INTO dds.dm_couriers(courier_id, courier_name)
+                        VALUES (%(courier_id)s, %(courier_name)s)
+                        ON CONFLICT (courier_id) DO UPDATE
+                        SET
+                            courier_name = EXCLUDED.courier_name;
+                    """,
+                    {
+                        "courier_id": courier_id,
+                        "courier_name": name
+                    }
+                )
 
 class CourierLoader:
-    WF_KEY = "courier_from_stg_to_dds_workflow"
-    LAST_LOADED_ID_KEY = "last_loaded_id"
-    
-    def __init__(self, pg_conn: PgConnect, log: Logger) -> None:
-        self.conn = pg_conn
-        self.dds = CourierDestRepository()
-        self.raw = CourierOriginRepository()
+    _LOG_THRESHOLD = 2
+    _SESSION_LIMIT = 10000
+
+    WF_KEY = "couriers_stg_to_dds_workflow"
+    LAST_LOADED_TS_KEY = "last_loaded_ts"
+
+    def __init__(self, collection_loader: CourierReader, pg_dest: PgConnect, pg_saver: CourierSaver, logger: Logger) -> None:
+        self.collection_loader = collection_loader
+        self.pg_saver = pg_saver
+        self.pg_dest = pg_dest
         self.settings_repository = DdsEtlSettingsRepository()
-        self.log = log
-        
+        self.log = logger
 
-    def parser_js(self, raws: List[CourierJsonObj]) -> List[CourierDdsObj]:
-        res = []
-        for r in raws:
-            # log.info('!!LOG2:' + str(r))
-            object_value = str(r.object_value).replace("'", '"')
-            courier_json = json.loads(object_value)
-            t = CourierDdsObj(id=r.id,
-                           courier_id=courier_json['_id'],
-                           courier_name=courier_json['name']
-                           )
-
-            res.append(t)
-        return res
-    
-    def load_couriers(self):
+    def run_copy(self) -> int:
         # открываем транзакцию.
         # Транзакция будет закоммичена, если код в блоке with пройдет успешно (т.е. без ошибок).
         # Если возникнет ошибка, произойдет откат изменений (rollback транзакции).
-        with self.conn.connection() as conn:
-        
+        with self.pg_dest.connection() as conn:
+
+            # Прочитываем состояние загрузки
+            # Если настройки еще нет, заводим ее.
             wf_setting = self.settings_repository.get_setting(conn, self.WF_KEY)
             if not wf_setting:
-                wf_setting = EtlSetting(id=0, workflow_key=self.WF_KEY, workflow_settings={self.LAST_LOADED_ID_KEY: -1})
+                wf_setting = EtlSetting(
+                    id=0,
+                    workflow_key=self.WF_KEY,
+                    workflow_settings={
+                        # JSON ничего не знает про даты. Поэтому записываем строку, которую будем кастить при использовании.
+                        # А в БД мы сохраним именно JSON.
+                        self.LAST_LOADED_TS_KEY: datetime(2022, 1, 1).isoformat()
+                    }
+                )
 
-            # Вычитываем очередную пачку объектов.
-            last_loaded_id = wf_setting.workflow_settings[self.LAST_LOADED_ID_KEY]
-            loaded_queue = self.raw.load_raw_courier(conn, last_loaded_id)
-            loaded_queue.sort(key=lambda x: x.id)
-            courier_load = self.parser_js(loaded_queue)
+            last_loaded_ts_str = wf_setting.workflow_settings[self.LAST_LOADED_TS_KEY]
+            last_loaded_ts = datetime.fromisoformat(last_loaded_ts_str)
+            self.log.info(f"starting to load from last checkpoint: {last_loaded_ts}")
 
-            for courier in courier_load:
-                log.info('!!LOG3:' + str(type(courier)))
-                log.info('!!LOG4:' + str(courier.courier_id))
-                log.info('!!LOG5:' + str(courier.id))
-                check_courier = self.dds.get_courier(conn, courier.courier_id)
-                if not check_courier:
-                    self.dds.insert_courier(conn,courier)
-                
-                wf_setting.workflow_settings[self.LAST_LOADED_ID_KEY] = courier.id
-                wf_setting_json = json2str(wf_setting.workflow_settings)
-                self.settings_repository.save_setting(conn, wf_setting.workflow_key, wf_setting_json)
+            load_queue = self.collection_loader.get_couriers(last_loaded_ts)
+            self.log.info(f"Found {len(load_queue)} documents to sync from couriers collection.")
+            if not load_queue:
+                self.log.info("Quitting.")
+                return 0
 
-                self.log.info(f"Finishing work. Last checkpoint: {wf_setting_json}")
+            i = 0
+            for d in load_queue:
+                self.pg_saver.save_courier(conn, str(d["courier_id"]), d["name"])
+
+                i += 1
+                if i % self._LOG_THRESHOLD == 0:
+                    self.log.info(f"processed {i} documents of {len(load_queue)} while syncing couriers.")
+
+            wf_setting.workflow_settings[self.LAST_LOADED_TS_KEY] = max([t["update_ts"] for t in load_queue])
+            wf_setting_json = json2str(wf_setting.workflow_settings)
+            self.settings_repository.save_setting(conn, wf_setting.workflow_key, wf_setting_json)
+
+            self.log.info(f"Finishing work. Last checkpoint: {wf_setting_json}")
+
+            return len(load_queue)
