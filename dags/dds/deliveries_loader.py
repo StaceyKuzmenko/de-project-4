@@ -1,62 +1,75 @@
 from logging import Logger
-from typing import List, Optional
+from typing import List, Optional, Dict
+from psycopg.rows import dict_row
 import json
 import logging
-from examples.dds.couriers_loader import CourierDdsObj, CourierDestRepository
 from examples.dds.dds_settings_repository import EtlSetting, DdsEtlSettingsRepository
 from lib import PgConnect
-from lib.dict_util import json2str
 from psycopg import Connection
-from psycopg.rows import class_row
-from pydantic import BaseModel
+from lib.dict_util import json2str
 from datetime import datetime, date, time
 
 log = logging.getLogger(__name__)
 
-class DeliveryJsonObj(BaseModel):
-    id: int
-    object_value: str
-    update_ts: datetime
+class DeliveryReader:
+    def __init__(self, pg: PgConnect) -> None:
+        self.pg_client = pg.client()
 
+    def get_deliveries(self, load_threshold: datetime, limit, log) -> List[Dict]:
 
-class DeliveryDdsObj(BaseModel):
-    id: int
-    order_id: str
-    order_ts: datetime
-    delivery_id: str
-    courier_id: str
-    address: str
-    delivery_ts: datetime
-    rate: float
-    sum: float
-    tip_sum: float
+        resultlist = []
 
-
-class DeliveryOriginRepository:
-    def load_deliveries(self, conn: Connection, last_loaded_record_id: int) -> List[DeliveryJsonObj]:
-        with conn.cursor(row_factory=class_row(DeliveryJsonObj)) as cur:
+        with self.pg_client.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                     SELECT
                         id,
-                        replace(object_value, '''', '"') as object_value,
+                        object_value,
                         update_ts
                     FROM stg.deliveries
-                    WHERE id > %(last_loaded_record_id)s
-                    ORDER BY id ASC;
+                    WHERE update_ts > %(load_threshold)s;
                 """,
-                {"last_loaded_record_id": last_loaded_record_id},
+                {"load_threshold": load_threshold},
             )
-            objs = cur.fetchall()
-        return objs
+            rows_list = cur.fetchall()
 
-class DeliveryDestRepository:
+            for row in rows_list:
+                delivery_dict = json.loads(row['object_value'])
+                resultlist.append({ 'order_id': self.get_order(delivery_dict['order_id']),
+                                    'order_ts': delivery_dict['order_ts'],
+                                    'delivery_id': delivery_dict['delivery_id'], 
+                                    'address': delivery_dict['address'],
+                                    'courier_id': self.get_courier(delivery_dict['courier_id']), 
+                                    'delivery_ts': delivery_dict['delivery_ts'],
+                                    'rate': delivery_dict['rate'],
+                                    'sum': delivery_dict['sum'],
+                                    'tip_sum': delivery_dict['tip_sum'],
+                                    'update_ts': row['update_ts']})
 
-    def insert_delivery(self, conn: Connection, delivery: DeliveryDdsObj) -> None:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                    INSERT INTO dds.dm_deliveries(order_id, order_ts, delivery_id, courier_id, address, delivery_ts, rate, sum, tip_sum)
+        return resultlist
+    
+    def get_courier(self, courier_id):
+        with self.pg_client.cursor(row_factory=dict_row) as cur:
+            cur.execute('select id from dds.dm_couriers where courier_id = %(courier_id)s;',
+                {"courier_id": courier_id},
+            )
+            row = cur.fetchone()
+            return row['id']
+
+    def get_order(self, order_key):
+        with self.pg_client.cursor(row_factory=dict_row) as cur:
+            cur.execute('select id from dds.dm_orders where order_key = %(order_key)s;',
+                {"order_key": order_key},
+            )
+            row = cur.fetchone()
+            return row['id']
+
+class DeliverySaver:
+        def save_delivery(self, conn: Connection, order_id: int, order_ts: datetime, delivery_id: str, courier_id: int, address: str, delivery_ts: datetime, rate: int, sum: float, tip_sum: float):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                        INSERT INTO dds.dm_deliveries(order_id, order_ts, delivery_id, courier_id, address, delivery_ts, rate, sum, tip_sum)
                     VALUES (%(order_id)s, %(order_ts)s, %(delivery_id)s, %(courier_id)s, %(address)s, %(delivery_ts)s, %(rate)s, %(sum)s, %(tip_sum)s)
                     ON CONFLICT (delivery_id) DO UPDATE
                     SET
@@ -67,98 +80,78 @@ class DeliveryDestRepository:
                         delivery_ts = EXCLUDED.delivery_ts,
                         rate = EXCLUDED.rate,
                         sum = EXCLUDED.sum,
-                        tip_sum = EXCLUDED.tip_sum
-                        ;
-                """,
-                {
-                    "order_id": delivery.order_id,
-                    "order_ts": delivery.order_ts,
-                    "delivery_id": delivery.delivery_id,
-                    "courier_id": delivery.courier_id,
-                    "address": delivery.address,
-                    "delivery_ts": delivery.delivery_ts,
-                    "rate": delivery.rate,
-                    "sum": delivery.sum,
-                    "tip_sum": delivery.tip_sum
-                },
-            )
-
-    def get_delivery(self, conn: Connection, delivery_id: str) -> Optional[DeliveryDdsObj]:
-        with conn.cursor(row_factory=class_row(DeliveryDdsObj)) as cur:
-            cur.execute(
-                """
-                    SELECT
-                        id,
-                        delivery_id,
-                        order_id,
-                        order_ts,
-                        courier_id,
-                        address,
-                        delivery_ts,
-                        rate,
-                        sum,
-                        tip_sum
-                    FROM dds.dm_deliveries
-                    WHERE delivery_id = %(delivery_id)s;
-                """,
-                {"delivery_id": delivery_id},
-            )
-            obj = cur.fetchone()
-        return obj
+                        tip_sum = EXCLUDED.tip_sum;
+                    """,
+                    {
+                        "order_id": order_id,
+                        "order_ts": order_ts,
+                        "delivery_id": delivery_id,
+                        "courier_id": courier_id,
+                        "address": address,
+                        "delivery_ts": delivery_ts,
+                        "rate": rate,
+                        "sum": sum,
+                        "tip_sum": tip_sum
+                    }
+                )
 
 class DeliveryLoader:
-    WF_KEY = "deliveries_to_dds_workflow"
-    LAST_LOADED_ID_KEY = "last_loaded_id"
+    _LOG_THRESHOLD = 2
+    _SESSION_LIMIT = 100
 
-    def __init__(self, pg: PgConnect, log: Logger) -> None:
-        self.dwh = pg
-        self.origin = DeliveryOriginRepository()
-        self.dds_couriers = CourierDestRepository()
-        self.dds_deliveries = DeliveryDestRepository()
-        self.settings_repository = DdsEtlSettingsRepository()
-        self.log = log
-
-    def parse_delivery(self, delivery: DeliveryJsonObj, courier_id: int) -> DeliveryDdsObj:
-        delivery_json = json.loads(delivery.object_value)
-
-        t = DeliveryDdsObj(id=0,
-                        delivery_id=delivery_json['delivery_id'],
-                        order_id=delivery_json['order_id'],
-                        order_ts=delivery_json['order_ts'],
-                        courier_id=delivery_json['courier_id'],
-                        address=delivery_json['address'],
-                        delivery_ts=delivery_json['delivery_ts'],
-                        rate=delivery_json['rate'],
-                        sum=delivery_json['sum'],
-                        tip_sum=delivery_json['tip_sum']
-                        )
-
-        return t
+    WF_KEY = "deliveries_from_stg_to_dds_workflow"
+    LAST_LOADED_TS_KEY = "last_loaded_ts"
     
-    def load_deliveries(self):
-        with self.dwh.connection() as conn:
+    def __init__(self, collection_loader: DeliveryReader, pg_dest: PgConnect, pg_saver: DeliverySaver, logger: Logger) -> None:
+        self.collection_loader = collection_loader
+        self.pg_saver = pg_saver
+        self.pg_dest = pg_dest
+        self.settings_repository = DdsEtlSettingsRepository()
+        self.log = logger
+        
+    
+    def run_copy(self) -> int:
+        # открываем транзакцию.
+        # Транзакция будет закоммичена, если код в блоке with пройдет успешно (т.е. без ошибок).
+        # Если возникнет ошибка, произойдет откат изменений (rollback транзакции).
+        with self.pg_dest.connection() as conn:
+
+            # Прочитываем состояние загрузки
+            # Если настройки еще нет, заводим ее.
             wf_setting = self.settings_repository.get_setting(conn, self.WF_KEY)
             if not wf_setting:
-                wf_setting = EtlSetting(id=0, workflow_key=self.WF_KEY, workflow_settings={self.LAST_LOADED_ID_KEY: -1})
+                wf_setting = EtlSetting(
+                    id=0,
+                    workflow_key=self.WF_KEY,
+                    workflow_settings={
+                        # JSON ничего не знает про даты. Поэтому записываем строку, которую будем кастить при использовании.
+                        # А в БД мы сохраним именно JSON.
+                        self.LAST_LOADED_TS_KEY: datetime(2022, 1, 1).isoformat()
+                    }
+                )
 
-            last_loaded_id = wf_setting.workflow_settings[self.LAST_LOADED_ID_KEY]
+            last_loaded_ts_str = wf_setting.workflow_settings[self.LAST_LOADED_TS_KEY]
+            last_loaded_ts = datetime.fromisoformat(last_loaded_ts_str)
+            self.log.info(f"starting to load from last checkpoint: {last_loaded_ts}")
 
-            load_queue = self.origin.load_deliveries(conn, last_loaded_id)
-            load_queue.sort(key=lambda x: x.id)
-            self.log.info('LOG 1:  ' + str(load_queue))
-            for delivery in load_queue:
+            load_queue = self.collection_loader.get_deliveries(last_loaded_ts, self._SESSION_LIMIT, self.log)
+            self.log.info(f"Found {len(load_queue)} documents to sync from deliveries collection.")
+            if not load_queue:
+                self.log.info("Quitting.")
+                return 0
 
-                delivery_json = json.loads(delivery.object_value)
-            
-                courier = self.dds_couriers.get_courier(conn, delivery_json['courier_id'])
-                if not courier:
-                    break
-              
-                delivery_to_load = self.parse_delivery(delivery, courier[0])
-                self.dds_deliveries.insert_delivery(conn, delivery_to_load)
+            i = 0
+            for d in load_queue:
+                self.pg_saver.save_delivery(conn, d["order_id"], d["order_ts"], d["delivery_id"], d["courier_id"], d["address"], d["delivery_ts"], d["rate"], d["sum"], d["tip_sum"])
 
-                wf_setting.workflow_settings[self.LAST_LOADED_ID_KEY] = delivery.id
-                wf_setting_json = json2str(wf_setting.workflow_settings)
-                self.settings_repository.save_setting(conn, wf_setting.workflow_key, wf_setting_json)
+                i += 1
+                if i % self._LOG_THRESHOLD == 0:
+                    self.log.info(f"processed {i} documents of {len(load_queue)} while syncing deliveries.")
 
-                self.log.info(f"Finishing work. Last checkpoint: {wf_setting_json}")
+            wf_setting.workflow_settings[self.LAST_LOADED_TS_KEY] = max([t["update_ts"] for t in load_queue])
+            wf_setting_json = json2str(wf_setting.workflow_settings)
+            self.settings_repository.save_setting(conn, wf_setting.workflow_key, wf_setting_json)
+
+            self.log.info(f"Finishing work. Last checkpoint: {wf_setting_json}")
+
+            return len(load_queue)
