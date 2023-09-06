@@ -33,29 +33,40 @@ class CourierLedgerRepository:
 	                            from (
                                     select 
                                         distinct dd.courier_id,
-                                        sum(dd.sum) over (partition by courier_id) order_total_sum,
-                                        avg(dd.rate) over (partition by courier_id) as rate_avg,
-                                        case when avg(dd.rate) over (partition by courier_id) < 4 then sum(dd.sum) over (partition by courier_id) * 0.05
-	                                        when avg(dd.rate) over (partition by courier_id) >= 4 and avg(dd.rate) over (partition by courier_id) < 4.5 then sum(dd.sum) over (partition by courier_id) * 0.07
-	                                        when avg(dd.rate) over (partition by courier_id) >= 4.5 and avg(dd.rate) over (partition by courier_id) < 4.9 then sum(dd.sum) over (partition by courier_id) * 0.08
-	                                        when avg(dd.rate) over (partition by courier_id) >= 4.9 then sum(dd.sum) over (partition by courier_id) * 0.1
+                                        sum(dd.sum) over (partition by dd.courier_id) order_total_sum,
+                                        avg(dd.rate) over (partition by dd.courier_id) as rate_avg,
+                                        case when avg(dd.rate) over (partition by dd.courier_id) < 4 then sum(dd.sum) over (partition by courier_id) * 0.05
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4 and avg(dd.rate) over (partition by courier_id) < 4.5 then sum(dd.sum) over (partition by courier_id) * 0.07
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4.5 and avg(dd.rate) over (partition by courier_id) < 4.9 then sum(dd.sum) over (partition by courier_id) * 0.08
+	                                        when avg(dd.rate) over (partition by dd.courier_id) >= 4.9 then sum(dd.sum) over (partition by courier_id) * 0.1
                                         end courier_initial_order_sum
                                     from dds.dm_deliveries dd) as b)
+                    insert into cdm.dm_courier_ledger (courier_id, 
+							courier_name, 
+							settlement_year, 
+							settlement_month, 
+							orders_count,
+							orders_total_sum,
+							rate_avg,
+							order_processing_fee,
+							courier_order_sum,
+							courier_tips_sum,
+							courier_reward_sum)    
                     select 
                         distinct dd.courier_id,
                         dc.courier_name,
                         extract (year from dd.order_ts) as settlement_year,
                         extract (month from dd.order_ts) as settlement_month,
-                        count(dd.order_id) over (partition by courier_id) as orders_count,
-                        sum(dd.sum) over (partition by courier_id) order_total_sum,
-                        avg(dd.rate) over (partition by courier_id) as rate_avg,
-                        sum(dd.sum) over (partition by courier_id) * 0.25 order_processing_fee,
+                        count(dd.order_id) over (partition by dd.courier_id) as orders_count,
+                        sum(dd.sum) over (partition by dd.courier_id) order_total_sum,
+                        avg(dd.rate) over (partition by dd.courier_id) as rate_avg,
+                        sum(dd.sum) over (partition by dd.courier_id) * 0.25 order_processing_fee,
                         c.courier_order_sum,
-                        sum(dd.tip_sum) over (partition by courier_id) as courier_tips_sum,
-                        (c.courier_order_sum + sum(dd.tip_sum) over (partition by courier_id)) * 0.95 as courier_reward_sum
+                        sum(dd.tip_sum) over (partition by dd.courier_id) as courier_tips_sum,
+                        (c.courier_order_sum + sum(dd.tip_sum) over (partition by dd.courier_id)) * 0.95 as courier_reward_sum
                     from dds.dm_deliveries dd 
-                    left join dds.dm_couriers dc using(courier_id)
-                    left join c using(courier_id)
+                    left join dds.dm_couriers dc on dd.courier_id = dc.id
+                    left join c on dd.courier_id = c.courier_id
                     group by dd.courier_id, dd.order_ts, dc.courier_name, dd.order_id, dd.sum, dd.rate, dd.tip_sum, c.courier_order_sum;
                     """
                 )
